@@ -70,10 +70,57 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // CONNECT / TLS interception
 // ─────────────────────────────────────────
 
+// shouldInterceptHost checks if we should intercept TLS for this host.
+// Some CDN/streaming hosts send non-standard protocols that break HTTP/1.x fallback.
+func shouldInterceptHost(host string) bool {
+	bypass := []string{
+		"googlevideo.com",
+		"googleusercontent.com",
+		"rr",
+	}
+	for _, b := range bypass {
+		if strings.Contains(host, b) {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *Proxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
 		host = r.Host
+	}
+
+	// Skip interception for problematic hosts (just tunnel TLS without MITM)
+	if !shouldInterceptHost(host) {
+		// For these hosts, establish standard TLS without our CA interception
+		upstreamConn, err := tls.Dial("tcp", r.Host, &tls.Config{
+			InsecureSkipVerify: p.cfg.InsecureUpstream,
+		})
+		if err != nil {
+			logger.LogError("passthrough dial %s: %v", r.Host, err)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upstreamConn.Close()
+
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+		clientConn, _, err := hj.Hijack()
+		if err != nil {
+			logger.LogError("hijack: %v", err)
+			return
+		}
+		defer clientConn.Close()
+
+		_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		go io.Copy(upstreamConn, clientConn)
+		io.Copy(clientConn, upstreamConn)
+		return
 	}
 
 	// Hijack the raw connection.
@@ -111,7 +158,7 @@ func (p *Proxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	hdr, _ := br.Peek(3)
 
 	// HTTP/2 preface starts with "PRI"
-	if string(hdr) == "PRI" {
+	if string(hdr) == "PRI" && shouldInterceptHost(host) {
 		p.handleH2Tunnel(tlsClient, br, host)
 		return
 	}
@@ -262,6 +309,14 @@ func (p *Proxy) handleH2Tunnel(conn net.Conn, br *bufio.Reader, host string) {
 			req.URL.Scheme = "https"
 			req.URL.Host = host
 			removeHopByHop(req.Header)
+			// Enable retries on stream reset by providing GetBody
+			if req.Body != nil && req.Body != http.NoBody {
+				body, _ := io.ReadAll(req.Body)
+				req.Body = io.NopCloser(bytes.NewReader(body))
+				req.GetBody = func() (io.ReadCloser, error) {
+					return io.NopCloser(bytes.NewReader(body)), nil
+				}
+			}
 		},
 		Transport: p.transport(),
 		ModifyResponse: func(resp *http.Response) error {
@@ -276,8 +331,10 @@ func (p *Proxy) handleH2Tunnel(conn net.Conn, br *bufio.Reader, host string) {
 	// Wrap connection so net/http can serve it.
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Wrap ResponseWriter to capture status code
+			rw := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 			if err := p.cfg.Middleware.RunRequest(r); err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
+				http.Error(rw, err.Error(), http.StatusBadGateway)
 				return
 			}
 			proto := "H2"
@@ -285,13 +342,11 @@ func (p *Proxy) handleH2Tunnel(conn net.Conn, br *bufio.Reader, host string) {
 				proto = "HTTPS"
 			}
 			start := time.Now()
-			rp.ServeHTTP(w, r)
-			logger.Log(&logger.RequestEvent{
-				Proto:    proto,
-				Method:   r.Method,
-				URL:      "https://" + host + r.RequestURI,
-				Duration: time.Since(start),
-			})
+			rp.ServeHTTP(rw, r)
+			e := logger.NewEvent(proto, r.Method, "https://"+host+r.RequestURI, r.Header, nil)
+			e.StatusCode = rw.code
+			e.Duration = time.Since(start)
+			logger.Log(e)
 		}),
 		TLSConfig: func() *tls.Config {
 			cfg, _ := p.cfg.CA.TLSConfigForHost(host)
@@ -300,7 +355,10 @@ func (p *Proxy) handleH2Tunnel(conn net.Conn, br *bufio.Reader, host string) {
 	}
 
 	// Serve over the already-TLS'd connection.
-	_ = srv.Serve(&singleConnListener{conn: &prefixedConn{Conn: conn, r: io.MultiReader(br, conn)}})
+	_ = srv.Serve(&singleConnListener{
+		conn:   &prefixedConn{Conn: conn, r: io.MultiReader(br, conn)},
+		closed: make(chan struct{}),
+	})
 }
 
 // ─────────────────────────────────────────
@@ -420,7 +478,6 @@ func (l *singleConnListener) Accept() (net.Conn, error) {
 		return nil, fmt.Errorf("done")
 	}
 	l.once = true
-	l.closed = make(chan struct{})
 	return l.conn, nil
 }
 func (l *singleConnListener) Close() error {
@@ -430,6 +487,17 @@ func (l *singleConnListener) Close() error {
 	return nil
 }
 func (l *singleConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+// statusRecorder captures the HTTP response status code.
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.code = code
+	r.ResponseWriter.WriteHeader(code)
+}
 
 // prefixedConn replays buffered bytes before delegating to the real conn.
 type prefixedConn struct {
