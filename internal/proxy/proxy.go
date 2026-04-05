@@ -145,6 +145,10 @@ func (p *Proxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		logger.LogError("TLS config for %s: %v", host, err)
 		return
 	}
+	// Force HTTP/1.1 with client to avoid H2 complexity.
+	// Upstream transport can still negotiate H2 independently.
+	tlsCfg.NextProtos = []string{"http/1.1"}
+
 	tlsClient := tls.Server(clientConn, tlsCfg)
 	if err := tlsClient.Handshake(); err != nil {
 		// Client may not trust our CA — expected for non-configured clients.
@@ -290,11 +294,15 @@ func (p *Proxy) transport() *http.Transport {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: p.cfg.InsecureUpstream,
 		},
-		ForceAttemptHTTP2:     true,
+		// Send requests via HTTP/1.1 to upstream, even if client used HTTP/2
+		// This avoids multiplexing issues with strict HTTP/2 servers
+		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          200,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		DisableKeepAlives:     false,
+		DisableCompression:    false,
 	}
 }
 
